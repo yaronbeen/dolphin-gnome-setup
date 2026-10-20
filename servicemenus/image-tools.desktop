@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Service
+MimeType=image/jpeg;image/png;image/webp;image/bmp;image/tiff;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+Actions=ImagePNG;ImageWebP;ImageHalf;
+
+[Desktop Action ImagePNG]
+Name=Convert to PNG
+Icon=image-x-generic
+Exec=@BIN@/dolphin-file-action png -- %F
+
+[Desktop Action ImageWebP]
+Name=Convert to WebP
+Icon=image-x-generic
+Exec=@BIN@/dolphin-file-action webp -- %F
+
+[Desktop Action ImageHalf]
+Name=Resize Image to 50%
+Icon=zoom-out
+Exec=@BIN@/dolphin-file-action half -- %F

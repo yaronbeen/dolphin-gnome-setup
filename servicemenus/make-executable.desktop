@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Service
+MimeType=text/x-shellscript;text/x-python;application/x-shellscript;application/x-python;text/x-ruby;application/x-ruby;text/x-perl;application/x-perl;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+Actions=MakeExecutable;
+
+[Desktop Action MakeExecutable]
+Name=Make Executable
+Icon=system-run
+Exec=@BIN@/dolphin-file-action executable -- %F

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+MimeType=image/*;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+X-KDE-MaxNumberOfUrls=1
+Actions=ImageEXIF;
+
+[Desktop Action ImageEXIF]
+Name=Show EXIF Data
+Icon=dialog-information
+Exec=@BIN@/dolphin-file-action exif -- %F

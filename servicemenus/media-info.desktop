@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/*;audio/*;image/*;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+X-KDE-MaxNumberOfUrls=1
+Actions=MediaInfo;
+
+[Desktop Action MediaInfo]
+Name=Show Media Info
+Icon=dialog-information
+Exec=@BIN@/dolphin-file-action media -- %F

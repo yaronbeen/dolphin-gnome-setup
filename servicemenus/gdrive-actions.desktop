@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;inode/directory;
+X-KDE-Priority=TopLevel
+X-KDE-Protocol=file
+X-KDE-MaxNumberOfUrls=1
+Icon=folder-cloud
+Actions=GDriveOpen;GDriveCopyLink;
+
+[Desktop Action GDriveOpen]
+Name=Open in Google Drive
+Icon=applications-internet
+Exec=@BIN@/gdrive-action open %f
+
+[Desktop Action GDriveCopyLink]
+Name=Copy Google Drive Link
+Icon=edit-copy
+Exec=@BIN@/gdrive-action copy %f

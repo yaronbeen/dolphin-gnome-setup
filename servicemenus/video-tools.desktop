@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/*;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+Actions=VideoMP4;VideoMP3;
+
+[Desktop Action VideoMP4]
+Name=Convert to MP4 (H.264)
+Icon=video-x-generic
+Exec=@BIN@/dolphin-file-action mp4 -- %F
+
+[Desktop Action VideoMP3]
+Name=Extract Audio as MP3
+Icon=audio-x-generic
+Exec=@BIN@/dolphin-file-action mp3 -- %F

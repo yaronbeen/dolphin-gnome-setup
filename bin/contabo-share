@@ -1,0 +1,362 @@
+#!/usr/bin/python3
+"""Nemo/Files helper: restricted SSH upload, progress dialog, clipboard URL."""
+
+import argparse
+import base64
+import fcntl
+import html
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlsplit
+
+MAX_BYTES = 500 * 1024 * 1024
+CONFIG_PATH = Path.home() / ".config/contabo-share/config.json"
+STATE_DIR = Path.home() / ".local/state/contabo-share"
+MAX_UPLOADS = 5
+
+
+class UploadError(Exception):
+    """An error suitable for the desktop dialog."""
+
+
+def show_message(message, error=False, gui=True):
+    if gui and shutil.which("zenity"):
+        subprocess.run(
+            ["zenity", "--error" if error else "--info", "--no-markup",
+             "--title=Contabo Share", "--width=480", f"--text={message}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        print(message, file=sys.stderr if error else sys.stdout)
+
+
+def copy_link(url):
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        command = ["wl-copy", "--type", "text/plain"]
+    elif os.environ.get("DISPLAY") and shutil.which("xclip"):
+        command = ["xclip", "-selection", "clipboard", "-in", "-quiet"]
+    else:
+        raise UploadError("No supported clipboard tool is available.")
+    # Clipboard owners stay running to serve paste requests. Do not wait for that owner.
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    process.stdin.write(url.encode())
+    process.stdin.close()
+    time.sleep(0.15)
+    if process.poll() not in (None, 0):
+        raise UploadError("The link could not be copied to the clipboard.")
+
+
+def upload(path, config, cancelled=None, progress=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        original = os.fstat(source.fileno())
+        if not stat.S_ISREG(original.st_mode):
+            raise UploadError("Select one regular file to upload. Zip folders before sharing them.")
+        if original.st_size > MAX_BYTES:
+            raise UploadError("This file is larger than the 500 MB upload limit.")
+        request = base64.urlsafe_b64encode(
+            json.dumps({"name": path.name, "size": original.st_size}).encode()
+        ).decode()
+        command = [
+            "ssh", "-i", config["key_path"], "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3", "-o", "ClearAllForwardings=yes",
+            "-T", f"{config['user']}@{config['host']}", f"share-upload {request}",
+        ]
+        process = None
+        deadline = time.monotonic() + 30 * 60
+        try:
+            with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+                process = subprocess.Popen(command, stdin=source, stdout=output, stderr=errors)
+                while process.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise UploadError("Upload timed out after 30 minutes. Please try again.")
+                    if cancelled and cancelled.is_set():
+                        raise UploadError("Upload cancelled.")
+                    if progress:
+                        sent = os.lseek(source.fileno(), 0, os.SEEK_CUR)
+                        percent = min(99, int(sent * 100 / max(original.st_size, 1)))
+                        progress(percent)
+                    time.sleep(0.2)
+                output.seek(0)
+                raw = output.read(16384)
+                try:
+                    result = json.loads(raw)
+                    if not isinstance(result, dict):
+                        raise ValueError
+                except (ValueError, UnicodeError):
+                    result = {}
+                if process.returncode != 0:
+                    errors.seek(0)
+                    detail = errors.read(4096).decode(errors="replace").strip()
+                    raise UploadError(
+                        result.get("error") or f"Could not upload to Contabo.\n{detail}"
+                    )
+                parsed = urlsplit(result.get("url", ""))
+                if (
+                    parsed.scheme != "https" or parsed.netloc != config["host"]
+                    or not parsed.path.startswith("/f/") or result.get("size") != original.st_size
+                ):
+                    raise UploadError("The server did not return a valid download link.")
+                current = os.fstat(source.fileno())
+                if (current.st_size, current.st_mtime_ns) != (
+                    original.st_size, original.st_mtime_ns
+                ):
+                    raise UploadError("The file changed during upload. Please upload it again.")
+                if progress:
+                    progress(100)
+                return result
+        finally:
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def read_history():
+    path = STATE_DIR / "history.json"
+    if path.exists():
+        records = json.loads(path.read_text())
+    elif (STATE_DIR / "last-upload.json").exists():
+        records = [json.loads((STATE_DIR / "last-upload.json").read_text())]
+    else:
+        return []
+    now = datetime.now(UTC)
+    return [
+        record for record in records
+        if datetime.fromisoformat(record["expires_at"]) > now
+    ]
+
+
+def atomic_json(path, values):
+    fd, temporary = tempfile.mkstemp(prefix="history-", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(values, stream, indent=2)
+            stream.write("\n")
+        Path(temporary).replace(path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def save_result(result):
+    """History writes are atomic and serialized across separately launched helpers."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE_DIR / "history.lock").open("a") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            records = read_history()
+        except (OSError, ValueError, KeyError, TypeError):
+            records = []
+        records = [record for record in records if record["url"] != result["url"]]
+        atomic_json(STATE_DIR / "history.json", [result, *records][:100])
+        atomic_json(STATE_DIR / "last-upload.json", result)
+
+
+def persist_results(results):
+    warnings = []
+    for result in results:
+        try:
+            save_result(result)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            warnings.append(f"History could not be saved: {exc}")
+    return warnings
+
+
+def recent_picker(extra=(), text="Choose an upload, then click Copy link."):
+    try:
+        history = read_history()
+    except (OSError, ValueError, KeyError, TypeError):
+        history = []
+    unique = {record["url"]: record for record in [*extra, *history]}
+    records = list(unique.values())[:100]
+    if not records:
+        show_message("No unexpired recent uploads yet.")
+        return None
+    command = [
+        "zenity", "--list", "--radiolist", "--title=Recent uploads — Contabo Share",
+        "--width=950", "--height=460", "--ok-label=Copy link", "--cancel-label=Close",
+        f"--text={html.escape(text)}", "--column=Select", "--column=URL", "--column=File",
+        "--column=Uploaded", "--column=Size", "--column=Expires", "--hide-column=2",
+        "--print-column=2", "--",
+    ]
+    for index, record in enumerate(records):
+        expires = datetime.fromisoformat(record["expires_at"])
+        uploaded = (
+            datetime.fromisoformat(record["created_at"])
+            if record.get("created_at") else expires - timedelta(hours=48)
+        )
+        size = record["size"] / (1024 * 1024)
+        # Zenity 4.0 parses option-shaped cell values even after '--'.
+        display_name = record["name"]
+        if display_name.startswith("-"):
+            display_name = " " + display_name
+        command.extend([
+            "TRUE" if index == 0 else "FALSE", record["url"], display_name,
+            uploaded.astimezone().strftime("%b %d %H:%M"), f"{size:.1f} MB",
+            expires.astimezone().strftime("%b %d %H:%M"),
+        ])
+    chosen = subprocess.run(command, capture_output=True, text=True)
+    if chosen.returncode != 0:
+        return None
+    url = chosen.stdout.strip()
+    if url not in unique:
+        raise UploadError("No upload was selected.")
+    return url
+
+
+def upload_batch(paths, config, gui, cancelled):
+    results, failures = [], []
+    progress = [0] * len(paths)
+    dialog = None
+    try:
+        if gui:
+            title = f"Uploading {len(paths)} files…" if len(paths) > 1 else paths[0].name
+            dialog = subprocess.Popen(
+                ["zenity", "--progress", "--title=Contabo Share", "--width=480",
+                 f"--text={html.escape(title)}", "--percentage=0", "--auto-close"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        with ThreadPoolExecutor(max_workers=MAX_UPLOADS) as pool:
+            futures = {
+                pool.submit(
+                    upload, path, config, cancelled,
+                    lambda value, index=index: progress.__setitem__(index, value),
+                ): path
+                for index, path in enumerate(paths)
+            }
+            pending = set(futures)
+            while pending:
+                if dialog and dialog.poll() is not None:
+                    cancelled.set()
+                if dialog and not cancelled.is_set():
+                    percent = min(99, int(sum(progress) / len(paths)))
+                    try:
+                        dialog.stdin.write(f"{percent}\n")
+                        dialog.stdin.flush()
+                    except BrokenPipeError:
+                        cancelled.set()
+                for future in list(pending):
+                    if not future.done():
+                        continue
+                    pending.remove(future)
+                    try:
+                        results.append(future.result())
+                    except (UploadError, OSError, ValueError, KeyError, TypeError) as exc:
+                        failures.append(f"{futures[future].name}: {exc}")
+                if pending:
+                    time.sleep(0.1)
+    finally:
+        if dialog:
+            if dialog.poll() is None:
+                dialog.terminate()
+            dialog.wait()
+    return results, failures
+
+
+def deliver_link(url, gui):
+    try:
+        copy_link(url)
+    except (UploadError, OSError) as exc:
+        show_message(
+            f"Upload succeeded, but copying failed: {exc}\n\nCopy this link:\n{url}",
+            error=not gui, gui=gui,
+        )
+        return False
+    if gui:
+        subprocess.run(
+            ["notify-send", "--app-name=Contabo Share", "--icon=emblem-shared",
+             "--expire-time=6000", "Link copied — ready to paste", "Paste into Discord."],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("files", nargs="*")
+    parser.add_argument("--recent", action="store_true", help="Choose a recent uploaded link")
+    parser.add_argument("--cli", action="store_true", help="No desktop dialogs")
+    parser.add_argument("--no-clipboard", action="store_true")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    args = parser.parse_args()
+    gui = not args.cli and bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    cancelled = threading.Event()
+
+    def interrupted(_signum, _frame):
+        cancelled.set()
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        if args.recent:
+            if gui:
+                url = recent_picker()
+                if url:
+                    if args.no_clipboard:
+                        show_message(url, gui=True)
+                    else:
+                        deliver_link(url, gui=True)
+            else:
+                print(json.dumps(read_history()))
+            return 0
+        if not args.files:
+            selected = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "").splitlines()
+            args.files = selected
+        if not 1 <= len(args.files) <= MAX_UPLOADS:
+            raise UploadError("Select between one and five files. Zip folders before sharing them.")
+        paths = [Path(file).absolute() for file in args.files]
+        config = json.loads(args.config.read_text())
+        results, failures = upload_batch(paths, config, gui, cancelled)
+        warnings = persist_results(results)
+        if not results:
+            raise UploadError("\n".join(failures) or "Upload cancelled.")
+        # Completion, clipboard and the picker remain usable if history persistence fails.
+        newest = results[-1]["url"]
+        copied = False
+        if not args.no_clipboard:
+            copied = deliver_link(newest, gui)
+        messages = [*failures, *warnings]
+        if messages:
+            if gui:
+                show_message("\n\n".join(messages), error=bool(failures), gui=True)
+            else:
+                print("\n\n".join(messages), file=sys.stderr)
+        if gui:
+            text = f"Uploaded {len(results)} file(s). "
+            text += "The newest link is already copied.\n" if copied else "\n"
+            url = recent_picker(reversed(results), text + "Choose any upload to copy its link.")
+            if url and not args.no_clipboard:
+                deliver_link(url, gui)
+            elif url:
+                show_message(url, gui=gui)
+        else:
+            print(json.dumps(results[0] if len(results) == 1 else results))
+        return 1 if failures else 0
+    except (UploadError, OSError, ValueError, KeyError, TypeError) as exc:
+        show_message(str(exc), error=True, gui=gui)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

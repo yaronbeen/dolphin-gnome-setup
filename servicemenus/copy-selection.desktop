@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;inode/directory;
+Actions=CopyPaths;CopyNames;CopyParents;CopyShellPaths;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocol=file
+X-KDE-Priority=TopLevel
+
+[Desktop Action CopyPaths]
+Name=Copy Path
+Icon=edit-copy
+Exec=@BIN@/dolphin-copy-selection paths %F
+
+[Desktop Action CopyNames]
+Name=Copy Filename
+Icon=edit-copy
+Exec=@BIN@/dolphin-copy-selection names %F
+
+[Desktop Action CopyShellPaths]
+Name=Copy Shell-Quoted Path(s)
+Icon=edit-copy
+Exec=@BIN@/dolphin-copy-selection shell %F
+
+[Desktop Action CopyParents]
+Name=Copy Parent Folder Path
+Icon=edit-copy
+Exec=@BIN@/dolphin-copy-selection parents %F

@@ -1,0 +1,116 @@
+#!/usr/bin/python3
+"""Local Dolphin actions; conversions never overwrite an existing file."""
+
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+def output_file(source, action, converted):
+    suffix = {"png": ".png", "webp": ".webp", "mp4": ".mp4", "mp3": ".mp3"}.get(action, source.suffix)
+    stem = source.stem + {"half": "_half", "mp4": "_converted"}.get(action, "")
+    index = 1
+    while True:
+        extra = "" if index == 1 else f" ({index})"
+        target = source.with_name(stem + extra + suffix)
+        try:
+            os.link(converted, target)
+        except FileExistsError:
+            index += 1
+            continue
+        return target
+
+
+def convert_file(source, action):
+    if not source.is_file():
+        raise ValueError("Select regular files, not folders.")
+    # Encode privately, then publish atomically without replacing any existing path.
+    with tempfile.TemporaryDirectory(prefix='.dolphin-convert-', dir=source.parent) as work:
+        suffix = {"png": ".png", "webp": ".webp", "mp4": ".mp4", "mp3": ".mp3"}.get(action, source.suffix)
+        target = Path(work) / ('output' + suffix)
+        if action in {"png", "webp", "half"}:
+            from PIL import Image, ImageOps
+            with Image.open(source) as original:
+                if getattr(original, "n_frames", 1) > 1:
+                    raise ValueError("Animated/multi-page images are not converted; use a dedicated editor.")
+                image = ImageOps.exif_transpose(original)
+                if action == "half":
+                    image = image.resize((max(1, image.width // 2), max(1, image.height // 2)), Image.Resampling.LANCZOS)
+                if target.suffix.lower() in {".jpg", ".jpeg", ".webp"}:
+                    transparent = "A" in image.getbands() or "transparency" in image.info
+                    image = image.convert("RGBA" if transparent and target.suffix.lower() == ".webp" else "RGB")
+                elif target.suffix.lower() == '.png' and image.mode not in {'1', 'L', 'LA', 'I', 'I;16', 'P', 'RGB', 'RGBA'}:
+                    image = image.convert('RGB')
+                image.save(target, **({"quality": 85} if action == "webp" else {}))
+        else:
+            options = (["-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+                       if action == "mp4" else ["-vn", "-codec:a", "libmp3lame", "-q:a", "2"])
+            result = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source), *options, str(target)],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                raise ValueError(result.stderr[-2000:].strip() or "Conversion failed.")
+        target.chmod(target.stat().st_mode & source.stat().st_mode & 0o666)
+        return output_file(source, action, target)
+
+
+def run_action(action, paths):
+    if action in {"terminal", "media", "exif"} and len(paths) != 1:
+        raise ValueError("Select exactly one item for this action.")
+    if action == "terminal":
+        folder = paths[0] if paths[0].is_dir() else paths[0].parent
+        subprocess.Popen(["konsole", "--workdir", str(folder)], start_new_session=True)
+    elif action in {"media", "exif"}:
+        command = ["mediainfo", str(paths[0])] if action == "media" else ["exiftool", "--", str(paths[0])]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError(result.stderr.strip() or "Could not read file information.")
+        subprocess.run(["zenity", "--text-info", f"--title={'Media Info' if action == 'media' else 'EXIF Data'}: {paths[0].name}",
+                        "--width=850", "--height=600", "--font=monospace"], input=result.stdout, text=True)
+    elif action == "sha256":
+        hashes = []
+        for path in paths:
+            if not path.is_file():
+                raise ValueError("Select regular files to calculate checksums.")
+            with path.open("rb") as stream:
+                hashes.append(hashlib.file_digest(stream, "sha256").hexdigest())
+        # Reuse the existing session-aware clipboard helper, with one hash per line.
+        subprocess.run([str(Path.home() / ".local/bin/dolphin-copy-selection"), "paths", *hashes], check=True)
+    elif action == "executable":
+        for path in paths:
+            if not path.is_file():
+                raise ValueError("Select regular files, not folders.")
+            path.chmod(path.stat().st_mode | 0o100)
+    else:
+        subprocess.run(["notify-send", "Dolphin", "Converting files… Originals will be kept."], check=False)
+        errors = []
+        done = 0
+        for path in paths:
+            try:
+                convert_file(path, action)
+                done += 1
+            except (OSError, ValueError, ImportError) as exc:
+                errors.append(f"{path.name}: {exc}")
+        if done:
+            subprocess.run(["notify-send", "Dolphin", f"Created {done} new file(s) beside the originals."], check=False)
+        if errors:
+            raise ValueError("\n\n".join(errors))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["png", "webp", "half", "mp4", "mp3", "terminal", "media", "exif", "sha256", "executable"])
+    parser.add_argument("files", nargs="+")
+    args = parser.parse_args()
+    try:
+        run_action(args.action, [Path(p).absolute() for p in args.files])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        subprocess.run(["zenity", "--error", "--no-markup", "--title=Dolphin file action", "--width=600", f"--text={exc}"], check=False)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
